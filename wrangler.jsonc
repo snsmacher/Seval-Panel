@@ -1,0 +1,18 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "analytics",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-02-17",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": { "enabled": true },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "analytics-db",
+      "database_id": "your-database-id-here"
+    }
+  ],
+  "vars": {
+    "ADMIN_PASSWORD": "your-password-here"
+  }
+}

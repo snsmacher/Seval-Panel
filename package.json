@@ -1,0 +1,16 @@
+{
+  "name": "analytics",
+  "private": true,
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev"
+  },
+  "dependencies": {
+    "hono": "^4.0.0"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0",
+    "@cloudflare/workers-types": "^5.0.0",
+    "typescript": "^5.0.0"
+  }
+}

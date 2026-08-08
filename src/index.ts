@@ -65,6 +65,54 @@ app.post("/track", async (c) => {
   return c.text("ok");
 });
 
+// ---- umami 兼容端点 ----
+// 接收 umami tracker 的 POST /api/collect，映射到 Seval hits 表
+app.post("/api/collect", async (c) => {
+  const body = await c.req.json().catch(() => ({}));
+  const payload = body?.payload || body;
+  const path = (payload?.url || payload?.path || "/").slice(0, 512);
+  const referrer = (payload?.referrer || body?.referrer || "").slice(0, 512);
+
+  const cf = c.req.raw.cf ?? {};
+  const ua = c.req.header("user-agent") ?? "";
+  const browser = /Edg\//.test(ua) ? "Edge"
+    : /Chrome/.test(ua) ? "Chrome"
+    : /Safari/.test(ua) ? "Safari"
+    : /Firefox/.test(ua) ? "Firefox"
+    : "";
+  const os = /Windows/.test(ua) ? "Windows"
+    : /Mac/.test(ua) ? "macOS"
+    : /Linux/.test(ua) ? "Linux"
+    : /iPhone|iPad/.test(ua) ? "iOS"
+    : /Android/.test(ua) ? "Android"
+    : "";
+  const device = /iPhone|Android/.test(ua) ? "mobile"
+    : /iPad|Tablet/.test(ua) ? "tablet"
+    : "desktop";
+  const isCN = (cf.country ?? "") === "CN";
+
+  c.executionCtx.waitUntil(
+    c.env.DB.prepare(
+      `INSERT INTO hits (path, country, city, region, ua, browser, os, device, bot_score, referrer, ip)
+       VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)`
+    ).bind(
+      path,
+      (cf.country ?? "").slice(0, 64),
+      isCN ? "" : (cf.city ?? "").slice(0, 64),
+      (cf.region ?? "").slice(0, 64),
+      ua.slice(0, 512),
+      browser,
+      os,
+      device,
+      cf.botManagement?.score ?? 0,
+      referrer,
+      (c.req.header("CF-Connecting-IP") ?? "").slice(0, 45),
+    ).run()
+  );
+
+  return c.text("ok");
+});
+
 app.get("/api/stats", async (c) => {
   const days = Math.min(Number(c.req.query("days")) || 7, 90);
 
@@ -92,13 +140,91 @@ app.get("/api/stats", async (c) => {
   return c.json({ totals: totals ?? { total: 0, pages: 0 }, human: (humanTotal as any)?.count ?? 0, countries: countries.results, browsers: browsers.results, devices: devices.results, hourly: hourly.results });
 });
 
+app.get("/callback", (c) => {
+  const code = c.req.query("code") || "";
+  const state = c.req.query("state") || "";
+  const error = c.req.query("error");
+  return c.html(`<!DOCTYPE html><html lang="zh"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>CF OAuth</title><style>:root{font:14px/1.5 system-ui,sans-serif;background:#f5f6f8;display:flex;justify-content:center;align-items:center;height:100vh}main{background:#fff;border-radius:12px;padding:32px 40px;max-width:420px;text-align:center;box-shadow:0 2px 12px rgba(0,0,0,.06)}h1{font-size:18px;font-weight:600;margin-bottom:8px}.code-box{background:#1d1d1f;color:#34c759;font:14px "SF Mono",monospace;padding:12px 16px;border-radius:8px;margin:16px 0;word-break:break-all;user-select:all}.hint{font-size:13px;color:#8c8c8c}</style></head><body><main>${error?`<h1 style="color:#ff3b30">授权失败</h1><p style="color:#8c8c8c">${error}</p>`:code?`<h1>授权完成</h1><p class="hint">复制下方授权码，粘贴到 CF Client 中</p><div class="code-box">${code}</div><p class="hint">复制后关闭此页面</p>`:`<h1>CF OAuth 回调</h1><p class="hint">等待授权中...</p>`}</main></body></html>`);
+});
+
+// ---- 初始化设置 ----
+app.get("/api/setup/status", async (c) => {
+  const row = await c.env.DB.prepare("SELECT value FROM settings WHERE key = 'admin_password'").first();
+  return c.json({ setup: !row });
+});
+
+app.post("/api/setup/save", async (c) => {
+  const { password, mode } = await c.req.json().catch(() => ({}));
+  if (!password || password.length < 4) return c.json({ ok: false, error: "密码至少4位" }, 400);
+  await c.env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('admin_password', ?1)").bind(password).run();
+  if (mode) await c.env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('mode', ?1)").bind(mode).run();
+  return c.json({ ok: true });
+});
+
 app.get("/admin", async (c) => {
+  // First run: check if password exists
+  const row = await c.env.DB.prepare("SELECT value FROM settings WHERE key = 'admin_password'").first();
+  if (!row) return c.html(setupHtml);
   const pw = c.req.query("pw");
-  if (pw !== c.env.ADMIN_PASSWORD) return c.html(loginHtml, 401);
+  if (pw !== (row as any).value) return c.html(loginHtml, 401);
   return c.html(dashboardHtml);
 });
 
 export default app;
+
+const setupHtml = `<!DOCTYPE html><html lang="zh"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Seval Panel - 初始化</title><style>:root{font:14px/1.5 system-ui,sans-serif;color:#1d1d1f;background:#f5f5f7}main{max-width:440px;margin:80px auto 0;padding:32px;background:rgba(255,255,255,.76);backdrop-filter:blur(20px)saturate(180%);border-radius:16px;border:1px solid rgba(0,0,0,.06)}h1{font-size:22px;font-weight:600;letter-spacing:-.02em;margin-bottom:20px}h2{font-size:14px;font-weight:500;margin-bottom:8px;color:#8c8c8c}.step{display:none}.step.active{display:block}label{display:block;font-size:12px;font-weight:500;color:#8c8c8c;text-transform:uppercase;letter-spacing:.04em;margin-bottom:4px}input{width:100%;padding:10px 12px;border:1px solid rgba(0,0,0,.12);border-radius:8px;font:inherit;font-size:14px;box-sizing:border-box;outline:none;margin-bottom:12px}input:focus{border-color:#007aff;box-shadow:0 0 0 3px rgba(0,122,255,.12)}.btn{display:inline-block;padding:10px 20px;border:none;border-radius:8px;font:inherit;font-size:14px;font-weight:500;cursor:pointer;transition:transform 100ms ease-out}.btn:active{transform:scale(.97)}.btn-primary{background:#007aff;color:#fff;margin-right:8px}.btn-ghost{background:rgba(0,0,0,.04);color:#1d1d1f}.option{display:flex;align-items:flex-start;gap:12px;padding:16px;border:1px solid rgba(0,0,0,.08);border-radius:10px;margin-bottom:10px;cursor:pointer;transition:border-color 150ms,background 120ms}.option:hover{border-color:#007aff;background:rgba(0,122,255,.03)}.option.selected{border-color:#007aff;background:rgba(0,122,255,.06)}.option .radio{width:18px;height:18px;border-radius:50%;border:2px solid rgba(0,0,0,.2);flex-shrink:0;margin-top:2px;transition:border-color 150ms}.option.selected .radio{border-color:#007aff;background:radial-gradient(circle,#007aff 40%,transparent 45%)}.option strong{display:block;font-size:14px;margin-bottom:2px}.option span{font-size:12px;color:#8c8c8c}.done{text-align:center;padding:20px}.done .check{font-size:40px;margin-bottom:12px}.code-box{background:#1d1d1f;color:#34c759;font:12px "SF Mono",Consolas,monospace;padding:12px 16px;border-radius:8px;overflow-x:auto;white-space:pre-wrap;user-select:all;margin-top:12px}.status{font-size:13px;color:#ff3b30;margin-top:8px}</style></head><body><main>
+<div class="step active" id="step1">
+<h1>欢迎使用 Seval Panel</h1><h2>第 1 步：设置管理密码</h2>
+<label>密码（至少 4 位）</label>
+<input id="pw" type="password" placeholder="设置登录密码" autofocus>
+<button class="btn btn-primary" onclick="nextStep()">下一步</button>
+<div class="status" id="err"></div>
+</div>
+<div class="step" id="step2">
+<h1>选择接入方式</h1><h2>第 2 步：将埋点代码放入网站</h2>
+<div class="option" data-mode="native" onclick="selectMode(this)">
+<div class="radio"></div><div><strong>原生方式</strong><span>使用 Seval 原始埋点脚本，功能完整</span></div>
+</div>
+<div class="option" data-mode="umami" onclick="selectMode(this)">
+<div class="radio"></div><div><strong>umami 兼容</strong><span>使用 umami 埋点脚本，只需改 data-host</span></div>
+</div>
+<div class="code-box" id="codeSnippet" style="display:none"></div>
+<button class="btn btn-primary" onclick="finish()">完成设置</button>
+</div>
+<div class="step" id="step3"><div class="done">
+<div class="check">✅</div>
+<h1>设置完成</h1><p style="color:#8c8c8c;margin-bottom:16px">Seval Panel 已就绪</p>
+<button class="btn btn-primary" onclick="location.href='/admin'">前往面板</button>
+</div></div>
+</main>
+<script>
+let pw='',mode='native';
+function nextStep(){
+  pw=document.getElementById('pw').value;if(pw.length<4){document.getElementById('err').textContent='密码至少4位';return}
+  document.getElementById('err').textContent='';
+  document.getElementById('step1').classList.remove('active');document.getElementById('step2').classList.add('active');
+  showCode();
+}
+function selectMode(el){
+  document.querySelectorAll('.option').forEach(o=>o.classList.remove('selected'));
+  el.classList.add('selected');mode=el.dataset.mode;showCode();
+}
+function showCode(){
+  var host=location.origin,box=document.getElementById('codeSnippet');
+  if(mode==='umami'){
+    box.textContent='<!-- 将 umami 埋点中的 script.js 替换为 Seval -->\\n<script async src="'+host+'/track.js" data-host="'+host+'"></script>';
+  }else{
+    box.textContent='<!-- 原生 Seval 埋点 -->\\n<script async src="'+host+'/track.js" data-host="'+host+'"></script>';
+  }
+  box.style.display='block';
+}
+async function finish(){
+  var r=await fetch('/api/setup/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw,mode:mode})});
+  var j=await r.json();
+  if(!j.ok){document.getElementById('err').textContent=j.error;return}
+  document.getElementById('step2').classList.remove('active');document.getElementById('step3').classList.add('active');
+}
+</script></body></html>`;
 
 const loginHtml = `<!DOCTYPE html><html lang="zh"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>访问数据监控大屏</title><style>:root{font:100%/1.5 system-ui,sans-serif;color:#1d1d1f;background:#f5f5f7}main{max-width:360px;margin:120px auto 0;padding:32px;background:rgba(255,255,255,.72);backdrop-filter:blur(20px)saturate(180%);border-radius:20px;border:1px solid rgba(0,0,0,.06)}h1{font-size:24px;font-weight:500;letter-spacing:-.01em;margin:0 0 24px;text-align:center}input{width:100%;padding:12px 16px;border:1px solid rgba(0,0,0,.12);border-radius:10px;font:inherit;font-size:15px;box-sizing:border-box;outline:none;transition:border-color 150ms ease}input:focus{border-color:#007aff}button{width:100%;padding:12px;margin-top:16px;border:none;border-radius:10px;background:#007aff;color:#fff;font:inherit;font-size:15px;font-weight:500;cursor:pointer;transition:transform 100ms ease-out,opacity 150ms ease}button:active{transform:scale(.97)}</style></head><body><main><h1>访问统计</h1><form onsubmit="location.href='?pw='+encodeURIComponent(document.getElementById('p').value);return!1"><input id="p" type="password" placeholder="密码" autofocus><button type="submit">登录</button></form></main></body></html>`;
 

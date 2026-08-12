@@ -28,6 +28,7 @@ npx wrangler d1 create analytics-db
 npx wrangler d1 execute analytics-db --file=./migrations/0001_init.sql --remote
 npx wrangler d1 execute analytics-db --file=./migrations/0002_add_ip.sql --remote
 npx wrangler d1 execute analytics-db --file=./migrations/0003_settings.sql --remote
+npx wrangler d1 execute analytics-db --file=./migrations/0004_events.sql --remote
 
 # 4. 部署
 npx wrangler deploy
@@ -42,6 +43,18 @@ npx wrangler deploy
 ```
 
 或使用umami埋点进行接入
+
+## 事件埋点
+
+引入 track.js 后，调用全局 `seval.track(name, value?)` 上报自定义事件：
+
+```html
+<script src="https://your-worker.workers.dev/track.js" data-host="https://your-worker.workers.dev" defer></script>
+<button onclick="seval.track('click','signup-btn')">注册</button>
+<a href="/ebook.pdf" onclick="seval.track('download','ebook.pdf')">下载</a>
+```
+
+事件名 `name` 必填，事件值 `value` 可选。umami 用户可继续用 `/api/collect` 上报 `type: 'event'` 事件，自动兼容。
 
 ## 仪表盘
 

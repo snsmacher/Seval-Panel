@@ -7,4 +7,5 @@
   t();
   var o=null;d.addEventListener('astro:page-load',t);d.addEventListener('turbolinks:load',t);
   window.addEventListener('popstate',function(){if(o!==location.pathname){o=location.pathname;p=o;t()}});
+  window.seval={track:function(n,v){var b=JSON.stringify({name:n,value:v,path:location.pathname});navigator.sendBeacon?navigator.sendBeacon(h+'/api/event',b):fetch(h+'/api/event',{method:'POST',body:b,keepalive:!0})}};
 })(document,'script');

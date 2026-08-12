@@ -1,4 +1,4 @@
-import { Hono } from "hono";
+import { Hono, type Context } from "hono";
 import { cors } from "hono/cors";
 
 type Env = { DB: D1Database; ADMIN_PASSWORD: string };
@@ -7,28 +7,10 @@ const app = new Hono<{ Bindings: Env }>();
 
 app.use("/*", cors({ origin: "*" }));
 
-app.get("/track.js", (c) =>
-  c.text(`(function(d){
-  var e=d.currentScript||d.querySelector('script[data-analytics]');
-  var h=e?e.getAttribute('data-host'):'';
-  if(!h)return;
-  var p=location.pathname,r=d.referrer;
-  function t(){navigator.sendBeacon?navigator.sendBeacon(h+'/track',JSON.stringify({path:p,referrer:r})):fetch(h+'/track',{method:'POST',body:JSON.stringify({path:p,referrer:r}),keepalive:!0})}
-  t();
-  var o=null;d.addEventListener('astro:page-load',t);d.addEventListener('turbolinks:load',t);
-  window.addEventListener('popstate',function(){if(o!==location.pathname){o=location.pathname;p=o;t()}});
-})(document);`, {
-    headers: { "Content-Type": "application/javascript", "Cache-Control": "public, max-age=3600" },
-  })
-);
-
-app.post("/track", async (c) => {
-  const { path, referrer } = await c.req.json().catch(() => ({}));
-  if (!path) return c.text("missing path", 400);
-
-  const cf = c.req.raw.cf ?? {};
+// 解析 geo/ua/browser/os/device 上下文，供 /track、/api/collect、/api/event 复用
+function parseContext(c: Context<{ Bindings: Env }>) {
+  const cf = (c.req.raw as any).cf ?? {};
   const ua = c.req.header("user-agent") ?? "";
-
   const browser = /Edg\//.test(ua) ? "Edge"
     : /Chrome/.test(ua) ? "Chrome"
     : /Safari/.test(ua) ? "Safari"
@@ -41,24 +23,49 @@ app.post("/track", async (c) => {
     : /Android/.test(ua) ? "Android"
     : "";
   const device = /Mobile/.test(ua) ? "mobile" : /Tablet|iPad/.test(ua) ? "tablet" : "desktop";
-
   const isCN = (cf.country ?? "") === "CN";
+  return {
+    country: (cf.country ?? "").slice(0, 64),
+    city: isCN ? "" : (cf.city ?? "").slice(0, 64),
+    region: (cf.region ?? "").slice(0, 64),
+    ua: ua.slice(0, 512),
+    browser, os, device,
+    bot_score: cf.botManagement?.score ?? 0,
+    ip: (c.req.header("CF-Connecting-IP") ?? "").slice(0, 45),
+  };
+}
+
+app.get("/track.js", (c) =>
+  c.text(`(function(d){
+  var e=d.currentScript||d.querySelector('script[data-analytics]');
+  var h=e?e.getAttribute('data-host'):'';
+  if(!h)return;
+  var p=location.pathname,r=d.referrer;
+  function t(){navigator.sendBeacon?navigator.sendBeacon(h+'/track',JSON.stringify({path:p,referrer:r})):fetch(h+'/track',{method:'POST',body:JSON.stringify({path:p,referrer:r}),keepalive:!0})}
+  t();
+  var o=null;d.addEventListener('astro:page-load',t);d.addEventListener('turbolinks:load',t);
+  window.addEventListener('popstate',function(){if(o!==location.pathname){o=location.pathname;p=o;t()}});
+  window.seval={track:function(n,v){var b=JSON.stringify({name:n,value:v,path:location.pathname});navigator.sendBeacon?navigator.sendBeacon(h+'/api/event',b):fetch(h+'/api/event',{method:'POST',body:b,keepalive:!0})}};
+})(document);`, {
+    headers: { "Content-Type": "application/javascript", "Cache-Control": "public, max-age=3600" },
+  })
+);
+
+app.post("/track", async (c) => {
+  const { path, referrer } = await c.req.json().catch(() => ({}));
+  if (!path) return c.text("missing path", 400);
+  const ctx = parseContext(c);
+
   c.executionCtx.waitUntil(
     c.env.DB.prepare(
       `INSERT INTO hits (path, country, city, region, ua, browser, os, device, bot_score, referrer, ip)
        VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)`
     ).bind(
       path.slice(0, 512),
-      (cf.country ?? "").slice(0, 64),
-      isCN ? "" : (cf.city ?? "").slice(0, 64),
-      (cf.region ?? "").slice(0, 64),
-      ua.slice(0, 512),
-      browser,
-      os,
-      device,
-      cf.botManagement?.score ?? 0,
+      ctx.country, ctx.city, ctx.region, ctx.ua,
+      ctx.browser, ctx.os, ctx.device, ctx.bot_score,
       (referrer ?? "").slice(0, 512),
-      (c.req.header("CF-Connecting-IP") ?? "").slice(0, 45),
+      ctx.ip,
     ).run()
   );
 
@@ -66,47 +73,59 @@ app.post("/track", async (c) => {
 });
 
 // ---- umami 兼容端点 ----
-// 接收 umami tracker 的 POST /api/collect，映射到 Seval hits 表
+// 接收 umami tracker 的 POST /api/collect：type=pageview 写入 hits，type=event 写入 events
 app.post("/api/collect", async (c) => {
   const body = await c.req.json().catch(() => ({}));
   const payload = body?.payload || body;
-  const path = (payload?.url || payload?.path || "/").slice(0, 512);
+  const ctx = parseContext(c);
   const referrer = (payload?.referrer || body?.referrer || "").slice(0, 512);
 
-  const cf = c.req.raw.cf ?? {};
-  const ua = c.req.header("user-agent") ?? "";
-  const browser = /Edg\//.test(ua) ? "Edge"
-    : /Chrome/.test(ua) ? "Chrome"
-    : /Safari/.test(ua) ? "Safari"
-    : /Firefox/.test(ua) ? "Firefox"
-    : "";
-  const os = /Windows/.test(ua) ? "Windows"
-    : /Mac/.test(ua) ? "macOS"
-    : /Linux/.test(ua) ? "Linux"
-    : /iPhone|iPad/.test(ua) ? "iOS"
-    : /Android/.test(ua) ? "Android"
-    : "";
-  const device = /iPhone|Android/.test(ua) ? "mobile"
-    : /iPad|Tablet/.test(ua) ? "tablet"
-    : "desktop";
-  const isCN = (cf.country ?? "") === "CN";
+  // umami 事件：type === 'event' 或携带 event_name
+  if (payload?.type === "event" || payload?.event_name) {
+    const name = String(payload?.event_name ?? "").slice(0, 512);
+    if (!name) return c.text("missing event_name", 400);
+    const ev = payload?.event_data;
+    const value = (ev == null ? "" : typeof ev === "string" ? ev : JSON.stringify(ev)).slice(0, 512);
+    const path = (payload?.url || payload?.path || "/").slice(0, 512);
+    c.executionCtx.waitUntil(
+      c.env.DB.prepare(
+        `INSERT INTO events (name, value, path, country, city, region, ua, browser, os, device, bot_score, referrer, ip)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)`
+      ).bind(name, value, path, ctx.country, ctx.city, ctx.region, ctx.ua, ctx.browser, ctx.os, ctx.device, ctx.bot_score, referrer, ctx.ip).run()
+    );
+    return c.text("ok");
+  }
 
+  // 默认 pageview
+  const path = (payload?.url || payload?.path || "/").slice(0, 512);
   c.executionCtx.waitUntil(
     c.env.DB.prepare(
       `INSERT INTO hits (path, country, city, region, ua, browser, os, device, bot_score, referrer, ip)
        VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)`
+    ).bind(path, ctx.country, ctx.city, ctx.region, ctx.ua, ctx.browser, ctx.os, ctx.device, ctx.bot_score, referrer, ctx.ip).run()
+  );
+  return c.text("ok");
+});
+
+// ---- 原生事件端点 ----
+// 接收 seval.track(name, value) 上报的事件
+app.post("/api/event", async (c) => {
+  const { name, value, path } = await c.req.json().catch(() => ({}));
+  if (!name) return c.text("missing name", 400);
+  const ctx = parseContext(c);
+  const referrer = (c.req.header("referer") ?? "").slice(0, 512);
+
+  c.executionCtx.waitUntil(
+    c.env.DB.prepare(
+      `INSERT INTO events (name, value, path, country, city, region, ua, browser, os, device, bot_score, referrer, ip)
+       VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)`
     ).bind(
-      path,
-      (cf.country ?? "").slice(0, 64),
-      isCN ? "" : (cf.city ?? "").slice(0, 64),
-      (cf.region ?? "").slice(0, 64),
-      ua.slice(0, 512),
-      browser,
-      os,
-      device,
-      cf.botManagement?.score ?? 0,
-      referrer,
-      (c.req.header("CF-Connecting-IP") ?? "").slice(0, 45),
+      String(name).slice(0, 512),
+      (value == null ? "" : String(value)).slice(0, 512),
+      (path ?? "").slice(0, 512),
+      ctx.country, ctx.city, ctx.region, ctx.ua,
+      ctx.browser, ctx.os, ctx.device, ctx.bot_score,
+      referrer, ctx.ip,
     ).run()
   );
 
@@ -116,7 +135,7 @@ app.post("/api/collect", async (c) => {
 app.get("/api/stats", async (c) => {
   const days = Math.min(Number(c.req.query("days")) || 7, 90);
 
-  const [totals, humanTotal, countries, browsers, devices, hourly] = await Promise.all([
+  const [totals, humanTotal, countries, browsers, devices, hourly, referrers, topPages, liveCount, eventTotals, events] = await Promise.all([
     c.env.DB.prepare(
       `SELECT COUNT(*) as total, COUNT(DISTINCT path) as pages FROM hits WHERE created_at > datetime('now', '-' || ? || ' days')`
     ).bind(days).first(),
@@ -135,9 +154,24 @@ app.get("/api/stats", async (c) => {
     c.env.DB.prepare(
       `SELECT ${days <= 2 ? "strftime('%Y-%m-%d ', created_at) || printf('%02d:00', (cast(strftime('%H', created_at) as integer) / 4) * 4)" : "strftime('%Y-%m-%d', created_at)"} as hour, COUNT(*) as count FROM hits WHERE created_at > datetime('now', '-' || ? || ' days') AND (bot_score >= 30 OR bot_score = 0) GROUP BY hour ORDER BY hour`
     ).bind(days).all(),
+    c.env.DB.prepare(
+      "SELECT CASE WHEN referrer = '' THEN '直接访问' WHEN referrer LIKE '%google.%' THEN 'Google' WHEN referrer LIKE '%baidu.%' THEN '百度' WHEN referrer LIKE '%bing.%' THEN 'Bing' WHEN referrer LIKE '%github.%' THEN 'GitHub' ELSE referrer END as source, COUNT(*) as count FROM hits WHERE created_at > datetime('now', '-' || ? || ' days') AND (bot_score >= 30 OR bot_score = 0) GROUP BY source ORDER BY count DESC LIMIT 10"
+    ).bind(days).all(),
+    c.env.DB.prepare(
+      "SELECT path, COUNT(*) as count FROM hits WHERE created_at > datetime('now', '-' || ? || ' days') AND (bot_score >= 30 OR bot_score = 0) GROUP BY path ORDER BY count DESC LIMIT 10"
+    ).bind(days).all(),
+    c.env.DB.prepare(
+      "SELECT COUNT(DISTINCT ip) as count FROM hits WHERE created_at > datetime('now', '-5 minutes') AND ip != ''"
+    ).first(),
+    c.env.DB.prepare(
+      "SELECT COUNT(*) as total, COUNT(DISTINCT name) as types FROM events WHERE created_at > datetime('now', '-' || ? || ' days')"
+    ).bind(days).first(),
+    c.env.DB.prepare(
+      "SELECT name, COUNT(*) as count FROM events WHERE created_at > datetime('now', '-' || ? || ' days') AND (bot_score >= 30 OR bot_score = 0) GROUP BY name ORDER BY count DESC LIMIT 10"
+    ).bind(days).all(),
   ]);
 
-  return c.json({ totals: totals ?? { total: 0, pages: 0 }, human: (humanTotal as any)?.count ?? 0, countries: countries.results, browsers: browsers.results, devices: devices.results, hourly: hourly.results });
+  return c.json({ totals: totals ?? { total: 0, pages: 0 }, human: (humanTotal as any)?.count ?? 0, countries: countries.results, browsers: browsers.results, devices: devices.results, hourly: hourly.results, referrers: referrers.results, topPages: topPages.results, live: (liveCount as any)?.count ?? 0, eventTotals: eventTotals ?? { total: 0, types: 0 }, events: events.results });
 });
 
 app.get("/callback", (c) => {
@@ -203,7 +237,7 @@ function nextStep(){
   pw=document.getElementById('pw').value;if(pw.length<4){document.getElementById('err').textContent='密码至少4位';return}
   document.getElementById('err').textContent='';
   document.getElementById('step1').classList.remove('active');document.getElementById('step2').classList.add('active');
-  showCode();
+  document.querySelector('.option[data-mode="native"]').classList.add('selected');showCode();
 }
 function selectMode(el){
   document.querySelectorAll('.option').forEach(o=>o.classList.remove('selected'));
@@ -212,9 +246,9 @@ function selectMode(el){
 function showCode(){
   var host=location.origin,box=document.getElementById('codeSnippet');
   if(mode==='umami'){
-    box.textContent='<!-- 将 umami 埋点中的 script.js 替换为 Seval -->\\n<script async src="'+host+'/track.js" data-host="'+host+'"></script>';
+    box.textContent='<!-- Seval -->\\n<script async src="'+host+'/track.js" data-host="'+host+'"><\\/script>';
   }else{
-    box.textContent='<!-- 原生 Seval 埋点 -->\\n<script async src="'+host+'/track.js" data-host="'+host+'"></script>';
+    box.textContent='<!-- Seval -->\\n<script async src="'+host+'/track.js" data-host="'+host+'"><\\/script>';
   }
   box.style.display='block';
 }
@@ -237,7 +271,17 @@ const dashboardHtml = `<!DOCTYPE html>
 <style>
 :root{font:14px/1.5 system-ui,-apple-system,sans-serif;color:#1d1d1f;background:#f5f6f8}
 *{box-sizing:border-box;margin:0}
-body{padding:28px;max-width:1080px;margin:0 auto}
+body{padding:0}
+.layout{display:flex;min-height:100vh}
+.sidebar{position:sticky;top:0;align-self:flex-start;width:208px;flex-shrink:0;height:100vh;padding:20px 0;border-right:1px solid #f0f0f3;overflow-y:auto}
+.nav{display:flex;flex-direction:column;gap:2px;padding:0 12px}
+.nav-item{padding:9px 12px;border-radius:8px;font-size:14px;color:#4a4a4a;cursor:pointer;transition:background 120ms;text-decoration:none}
+.nav-item:hover{background:rgba(0,0,0,.04)}
+.nav-item.active{background:rgba(46,199,201,.12);color:#0e8c8e;font-weight:500}
+.nav-sep{height:1px;background:#f0f0f3;margin:8px 4px}
+.main{flex:1;min-width:0;padding:28px}
+.view{display:none}
+.view.active{display:block}
 .header{margin-bottom:24px}
 .title{font-size:24px;font-weight:600;letter-spacing:-.02em;color:#1d1d1f}
 .subtitle{font-size:13px;color:#8c8c8c;margin-top:4px}
@@ -267,11 +311,27 @@ canvas{height:280px!important}
 .list div{padding:8px 0;border-bottom:1px solid #f5f5f7;color:#4a4a4a}
 .list div span{color:#a8a8a8;font-size:12px;margin-left:6px}
 .empty{text-align:center;color:#a8a8a8;font-size:13px;padding:40px 0}
-@media(max-width:780px){.stats{grid-template-columns:1fr}.list{grid-template-columns:1fr}.toolbar .apply{margin-left:0}}
+@media(max-width:780px){.stats{grid-template-columns:1fr}.list{grid-template-columns:1fr}.toolbar .apply{margin-left:0}.layout{flex-direction:column}.sidebar{position:static;height:auto;width:100%;border-right:none;border-bottom:1px solid #f0f0f3}.nav{flex-direction:row;overflow-x:auto;gap:4px}.main{padding:20px 16px}}
 @media(prefers-reduced-motion:reduce){.stat{transition:opacity 200ms ease;transform:none!important}}
 </style>
 </head>
 <body>
+<div class="layout">
+<aside class="sidebar">
+<nav class="nav">
+<a class="nav-item active" data-v="traffic" onclick="showView('traffic')">流量分析</a>
+<a class="nav-item" data-v="geo" onclick="showView('geo')">地域分布</a>
+<a class="nav-item" data-v="devices" onclick="showView('devices')">设备与浏览器</a>
+<a class="nav-item" data-v="sources" onclick="showView('sources')">来源分析</a>
+<a class="nav-item" data-v="pages" onclick="showView('pages')">热门页面</a>
+<a class="nav-item" data-v="events" onclick="showView('events')">事件跟踪</a>
+<a class="nav-item" data-v="recent" onclick="showView('recent')">最近访问</a>
+<div class="nav-sep"></div>
+<a class="nav-item" data-v="settings" onclick="showView('settings')">设置</a>
+<a class="nav-item" href="/admin">登出</a>
+</nav>
+</aside>
+<main class="main">
 <div class="header">
 <div class="title">访问数据监控大屏</div>
 <div class="subtitle">博客访问流量与用户分析</div>
@@ -285,6 +345,7 @@ canvas{height:280px!important}
 </div>
 </div>
 
+<div class="view active" id="view-traffic">
 <section class="section">
 <div class="section-head"><span class="section-title">流量分析</span><span class="section-en">Traffic</span></div>
 <div class="stats">
@@ -294,7 +355,9 @@ canvas{height:280px!important}
 </div>
 <div class="chart-card"><div class="chart-head"><span class="chart-title">流量趋势</span><span class="chart-unit">单位:次</span></div><canvas id="hourly"></canvas></div>
 </section>
+</div>
 
+<div class="view" id="view-geo">
 <section class="section">
 <div class="section-head"><span class="section-title">地域分布</span><span class="section-en">Geography</span></div>
 <div class="stats">
@@ -304,7 +367,9 @@ canvas{height:280px!important}
 </div>
 <div class="chart-card"><div class="chart-head"><span class="chart-title">国家/地区分布</span><span class="chart-unit">TOP 10</span></div><canvas id="countries"></canvas></div>
 </section>
+</div>
 
+<div class="view" id="view-devices">
 <section class="section">
 <div class="section-head"><span class="section-title">设备与浏览器</span><span class="section-en">Devices</span></div>
 <div class="stats">
@@ -314,14 +379,65 @@ canvas{height:280px!important}
 </div>
 <div class="chart-card"><div class="chart-head"><span class="chart-title">浏览器分布</span><span class="chart-unit">TOP 6</span></div><canvas id="browsers"></canvas></div>
 </section>
+</div>
 
+<div class="view" id="view-sources">
+<section class="section">
+<div class="section-head"><span class="section-title">来源分析</span><span class="section-en">Sources</span></div>
+<div class="stats">
+<div class="stat"><div class="stat-label">来源渠道</div><div class="stat-value" id="sourceCount">--</div><div class="stat-sub">流量来源数量</div></div>
+<div class="stat"><div class="stat-label">直接访问占比</div><div class="stat-value" id="directRate">--</div><div class="stat-sub">无来源页直接访问</div></div>
+<div class="stat"><div class="stat-label">实时在线</div><div class="stat-value" id="liveVisitors">--</div><div class="stat-sub">最近 5 分钟活跃访客</div></div>
+</div>
+<div class="chart-card"><div class="chart-head"><span class="chart-title">来源分布</span><span class="chart-unit">TOP 10</span></div><canvas id="referrerChart"></canvas></div>
+</section>
+</div>
+
+<div class="view" id="view-pages">
+<section class="section">
+<div class="section-head"><span class="section-title">热门页面</span><span class="section-en">Pages</span></div>
+<div class="chart-card"><div class="chart-head"><span class="chart-title">TOP 10 页面</span></div><canvas id="pagesChart"></canvas></div>
+</section>
+</div>
+
+<div class="view" id="view-events">
+<section class="section">
+<div class="section-head"><span class="section-title">事件跟踪</span><span class="section-en">Events</span></div>
+<div class="stats">
+<div class="stat"><div class="stat-label">事件总数</div><div class="stat-value" id="eventTotal">--</div><div class="stat-sub">全部事件触发次数</div></div>
+<div class="stat"><div class="stat-label">事件类型数</div><div class="stat-value" id="eventTypes">--</div><div class="stat-sub">不同事件名数量</div></div>
+<div class="stat"><div class="stat-label">主导事件</div><div class="stat-value" id="topEvent" style="font-size:20px">--</div><div class="stat-sub">触发最多的事件</div></div>
+</div>
+<div class="chart-card"><div class="chart-head"><span class="chart-title">TOP 10 事件</span></div><canvas id="eventsChart"></canvas></div>
+</section>
+</div>
+
+<div class="view" id="view-recent">
 <section class="section">
 <div class="section-head"><span class="section-title">最近访问</span><span class="section-en">Recent</span></div>
 <div class="list-card"><div class="list" id="recentList"><div class="empty">暂无访问数据</div></div></div>
 </section>
+</div>
+
+<div class="view" id="view-settings">
+<section class="section">
+<div class="section-head"><span class="section-title">设置</span><span class="section-en">Settings</span></div>
+<div class="chart-card">
+<div class="chart-head"><span class="chart-title">埋点代码</span></div>
+<div id="embedCode" style="background:#1d1d1f;color:#34c759;font:12px 'SF Mono',Consolas,monospace;padding:12px 16px;border-radius:8px;overflow-x:auto;white-space:pre-wrap;user-select:all"></div>
+<p class="stat-sub" style="margin-top:12px">将上述代码放入网站 head 即可开始统计。更多设置开发中。</p>
+</div>
+</section>
+</div>
 
 <script>
-let hChart,cChart,bChart;
+let hChart,cChart,bChart,rChart,pChart,eChart;
+function showView(id){
+  document.querySelectorAll('.view').forEach(v=>v.classList.toggle('active',v.id==='view-'+id));
+  document.querySelectorAll('.nav-item').forEach(n=>n.classList.toggle('active',n.dataset.v===id));
+  requestAnimationFrame(function(){[hChart,cChart,bChart,rChart,pChart,eChart].forEach(function(c){try{c&&c.resize()}catch(e){}})});
+}
+document.getElementById('embedCode').textContent='<!-- Seval -->\\n<script async src="'+location.origin+'/track.js" data-host="'+location.origin+'"></'+'script>';
 async function load(days){
   const r=await fetch('/api/stats?days='+days);const d=await r.json();
   document.getElementById('total').textContent=d.totals.total.toLocaleString();
@@ -358,10 +474,37 @@ async function load(days){
   if(bChart)bChart.destroy();
   bChart=new Chart(document.getElementById('browsers'),{type:'doughnut',data:{labels:browserEntries.map(x=>x.browser),datasets:[{data:browserEntries.map(x=>x.count),backgroundColor:['#2ec7c9','#ffce56','#6ee0b2','#975fe4','#ff9f7f','#5b8ff9'],borderWidth:0,hoverOffset:6}]},options:{responsive:true,maintainAspectRatio:false,cutout:'65%',plugins:{legend:{position:'right',labels:{font:{size:12},color:'#4a4a4a',padding:12,usePointStyle:true,pointStyle:'circle'}},tooltip:{backgroundColor:'#1d1d1f',titleFont:{size:11},bodyFont:{size:12},padding:8,cornerRadius:6}}}});
 
+  // 来源分析
+  const refEntries=(d.referrers||[]).map(x=>[x.source,x.count]);
+  const direct=refEntries.find(x=>x[0]==='直接访问');
+  const refTotal=refEntries.reduce((s,x)=>s+x[1],0);
+  document.getElementById('sourceCount').textContent=refEntries.length||'--';
+  document.getElementById('directRate').textContent=refTotal?Math.round((direct?direct[1]:0)/refTotal*100)+'%':'--';
+  document.getElementById('liveVisitors').textContent=d.live||'0';
+  const refTop10=refEntries.slice(0,10);
+  if(rChart)rChart.destroy();
+  rChart=new Chart(document.getElementById('referrerChart'),{type:'bar',data:{labels:refTop10.map(x=>x[0]),datasets:[{label:'访问量',data:refTop10.map(x=>x[1]),backgroundColor:'#5b8ff9',borderRadius:4,barThickness:18}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:{backgroundColor:'#1d1d1f',titleFont:{size:11},bodyFont:{size:12},padding:8,cornerRadius:6}},scales:{x:{ticks:{font:{size:11},color:'#a8a8a8'},grid:{display:false},border:{display:false}},y:{ticks:{font:{size:11},color:'#a8a8a8'},grid:{color:'#f0f0f3',drawBorder:false},border:{display:false},beginAtZero:true}}}});
+
+  // 热门页面
+  const pageEntries=(d.topPages||[]).map(x=>[x.path.replace(/^.*[/][/]/,'/'),x.count]).slice(0,10);
+  if(pChart)pChart.destroy();
+  pChart=new Chart(document.getElementById('pagesChart'),{type:'bar',data:{labels:pageEntries.map(x=>x[0]),datasets:[{label:'访问量',data:pageEntries.map(x=>x[1]),backgroundColor:'#975fe4',borderRadius:4,barThickness:18}]},options:{indexAxis:'y',responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:{backgroundColor:'#1d1d1f',titleFont:{size:11},bodyFont:{size:12},padding:8,cornerRadius:6}},scales:{x:{ticks:{font:{size:11},color:'#a8a8a8'},grid:{color:'#f0f0f3',drawBorder:false},border:{display:false},beginAtZero:true},y:{ticks:{font:{size:11},color:'#a8a8a8'},grid:{display:false},border:{display:false}}}}});
+
+  // 事件跟踪
+  const evEntries=(d.events||[]).map(x=>[x.name,x.count]);
+  const evTotals=d.eventTotals||{total:0,types:0};
+  document.getElementById('eventTotal').textContent=(evTotals.total||0).toLocaleString();
+  document.getElementById('eventTypes').textContent=evTotals.types||'--';
+  document.getElementById('topEvent').textContent=evEntries[0]?evEntries[0][0]:'--';
+  if(eChart)eChart.destroy();
+  eChart=new Chart(document.getElementById('eventsChart'),{type:'bar',data:{labels:evEntries.map(x=>x[0]),datasets:[{label:'触发次数',data:evEntries.map(x=>x[1]),backgroundColor:'#ff9f7f',borderRadius:4,barThickness:18}]},options:{indexAxis:'y',responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:{backgroundColor:'#1d1d1f',titleFont:{size:11},bodyFont:{size:12},padding:8,cornerRadius:6}},scales:{x:{ticks:{font:{size:11},color:'#a8a8a8'},grid:{color:'#f0f0f3',drawBorder:false},border:{display:false},beginAtZero:true},y:{ticks:{font:{size:11},color:'#a8a8a8'},grid:{display:false},border:{display:false}}}}});
+
   const recent=d.countries.slice(0,12);
   document.getElementById('recentList').innerHTML=recent.length?recent.map(x=>'<div>'+(x.city||'Unknown')+', '+x.country+'<span>· '+x.count+' 次</span></div>').join(''):'<div class="empty" style="grid-column:1/-1">暂无访问数据</div>';
 }
 load(+document.getElementById('rangeSelect').value);
 </script>
+</main>
+</div>
 </body>
 </html>`;

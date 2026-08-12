@@ -45,6 +45,7 @@ app.get("/track.js", (c) =>
   t();
   var o=null;d.addEventListener('astro:page-load',t);d.addEventListener('turbolinks:load',t);
   window.addEventListener('popstate',function(){if(o!==location.pathname){o=location.pathname;p=o;t()}});
+  // 全局事件埋点 API：seval.track(name, value) → POST /api/event
   window.seval={track:function(n,v){var b=JSON.stringify({name:n,value:v,path:location.pathname});navigator.sendBeacon?navigator.sendBeacon(h+'/api/event',b):fetch(h+'/api/event',{method:'POST',body:b,keepalive:!0})}};
 })(document);`, {
     headers: { "Content-Type": "application/javascript", "Cache-Control": "public, max-age=3600" },
@@ -135,6 +136,11 @@ app.post("/api/event", async (c) => {
 app.get("/api/stats", async (c) => {
   const days = Math.min(Number(c.req.query("days")) || 7, 90);
 
+  // 并行查询各维度统计，顺序与下方解构变量一一对应：
+  //   totals(PV+去重页面数) humanTotal(独立访客) countries(地域TOP30) browsers(浏览器)
+  //   devices(设备) hourly(流量趋势) referrers(来源TOP10) topPages(热门页面TOP10)
+  //   liveCount(实时在线) eventTotals(事件总数/类型数) events(TOP10事件)
+  // 过滤 bot_score>=30 OR =0：排除 1-29 的疑似爬虫（events 同理）
   const [totals, humanTotal, countries, browsers, devices, hourly, referrers, topPages, liveCount, eventTotals, events] = await Promise.all([
     c.env.DB.prepare(
       `SELECT COUNT(*) as total, COUNT(DISTINCT path) as pages FROM hits WHERE created_at > datetime('now', '-' || ? || ' days')`
@@ -432,18 +438,22 @@ canvas{height:280px!important}
 
 <script>
 let hChart,cChart,bChart,rChart,pChart,eChart;
+// 侧边栏视图切换：显隐 .view + 高亮 nav-item；下一帧重绘图表（display:none 的 canvas 尺寸需刷新）
 function showView(id){
   document.querySelectorAll('.view').forEach(v=>v.classList.toggle('active',v.id==='view-'+id));
   document.querySelectorAll('.nav-item').forEach(n=>n.classList.toggle('active',n.dataset.v===id));
   requestAnimationFrame(function(){[hChart,cChart,bChart,rChart,pChart,eChart].forEach(function(c){try{c&&c.resize()}catch(e){}})});
 }
+// 设置视图：填充埋点代码（host 取当前域名；用 </"+"script> 拼接，避免 HTML 解析提前闭合 <script>）
 document.getElementById('embedCode').textContent='<!-- Seval -->\\n<script async src="'+location.origin+'/track.js" data-host="'+location.origin+'"></'+'script>';
 async function load(days){
   const r=await fetch('/api/stats?days='+days);const d=await r.json();
+  // 流量分析：PV / 独立访客 / 页面数
   document.getElementById('total').textContent=d.totals.total.toLocaleString();
   document.getElementById('visitors').textContent=d.human.toLocaleString();
   document.getElementById('botRate').textContent=d.totals.pages||'--';
 
+  // 地域分布：国家/城市数 + 主导来源
   const topCountries={};
   d.countries.forEach(x=>{const k=x.country||'Unknown';topCountries[k]=(topCountries[k]||0)+x.count});
   const countryEntries=Object.entries(topCountries);
@@ -454,6 +464,7 @@ async function load(days){
   document.getElementById('cityCount').textContent=totalCities||'--';
   document.getElementById('topCountry').textContent=topCountry;
 
+  // 设备与浏览器：浏览器种类 / 桌面占比 / 主导浏览器
   const browserEntries=d.browsers.filter(x=>x.browser);
   const topBrowserEntry=browserEntries.sort((a,b)=>b.count-a.count)[0];
   const desktop=d.devices.find(x=>x.device==='desktop');
